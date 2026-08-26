@@ -1,7 +1,7 @@
 flask==3.1.0
 flask-cors==6.0.5
 joblib==1.5.3
-opencv-python-headless==4.13.0.88
+opencv-python-headless==4.10.0.84
 scikit-learn==1.8.0
 numpy
 gunicorn==23.0.0
