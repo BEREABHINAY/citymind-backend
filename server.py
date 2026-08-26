@@ -94,11 +94,17 @@ def home():
 
 @app.route("/api/health")
 def health():
+    return jsonify({
+        "status": "ok",
+        "usingRealData": classifier.USING_REAL_DATA,
+        "nodes": dqn_routing.NODES,
+        "edges": len(dqn_routing.EDGES)
+    })
 
 
 @app.route("/api/locations")
 def locations():
-    return jsonify([{"id": i, "name": n} for i, n in ID_TO_NAME.items()])
+    return jsonify(LOCATIONS)
 
 
 @app.route("/api/samples")
