@@ -81,10 +81,19 @@ def img_to_b64(img):
 
 # ------------------------------------------------------------------ ROUTES --
 
+# ------------------------------------------------------------------ ROUTES --
+
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "ok",
+        "service": "CityMind Backend",
+        "message": "API is running"
+    })
+
+
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "usingRealData": classifier.USING_REAL_DATA,
-                     "nodes": dqn_routing.NODES, "edges": len(dqn_routing.EDGES)})
 
 
 @app.route("/api/locations")
