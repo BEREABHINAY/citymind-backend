@@ -69,6 +69,9 @@ ID_TO_NAME = {
     "sunrise_apt": "Sunrise Apartments", "sunrise_hosp": "Sunrise Multispecialty Hospital",
     "grand_hotel": "City Grand Hotel", "spice_resto": "Spice Route Restaurant",
     "neon_cafe": "Neon Cafe",
+    "northgate_apt": "Northgate Apartments", "harbor_hotel": "Harbor View Hotel",
+    "blue_moon": "Blue Moon Diner", "westside_hosp": "Westside General Hospital",
+    "pixel_it": "Pixel IT Hub", "central_park_av": "Central Park Avenue",
 }
 NAME_TO_ID = {v: k for k, v in ID_TO_NAME.items()}
 
@@ -81,30 +84,15 @@ def img_to_b64(img):
 
 # ------------------------------------------------------------------ ROUTES --
 
-# ------------------------------------------------------------------ ROUTES --
-
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "ok",
-        "service": "CityMind Backend",
-        "message": "API is running"
-    })
-
-
 @app.route("/api/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "usingRealData": classifier.USING_REAL_DATA,
-        "nodes": dqn_routing.NODES,
-        "edges": len(dqn_routing.EDGES)
-    })
+    return jsonify({"status": "ok", "usingRealData": classifier.USING_REAL_DATA,
+                     "nodes": dqn_routing.NODES, "edges": len(dqn_routing.EDGES)})
 
 
 @app.route("/api/locations")
 def locations():
-    return jsonify(LOCATIONS)
+    return jsonify([{"id": i, "name": n} for i, n in ID_TO_NAME.items()])
 
 
 @app.route("/api/samples")
