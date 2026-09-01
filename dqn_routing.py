@@ -66,6 +66,18 @@ EDGES = [
     ("Spice Route Restaurant", "Market Street", 0.7, 2, 0.5),
     ("Old Town Square", "Neon Cafe", 0.9, 3, 0.4),
     ("Neon Cafe", "Old Town Square", 0.9, 3, 0.4),
+    ("MG Road Junction", "Northgate Apartments", 2.4, 7, 0.3),
+    ("Northgate Apartments", "MG Road Junction", 2.4, 7, 0.3),
+    ("Riverside Bridge", "Harbor View Hotel", 1.7, 5, 0.2),
+    ("Harbor View Hotel", "Riverside Bridge", 1.7, 5, 0.2),
+    ("Riverside Bridge", "Blue Moon Diner", 1.1, 3, 0.4),
+    ("Blue Moon Diner", "Riverside Bridge", 1.1, 3, 0.4),
+    ("City Grand Hotel", "Westside General Hospital", 1.6, 5, 0.3),
+    ("Westside General Hospital", "City Grand Hotel", 1.6, 5, 0.3),
+    ("Silicon Heights IT Park", "Pixel IT Hub", 1.2, 4, 0.4),
+    ("Pixel IT Hub", "Silicon Heights IT Park", 1.2, 4, 0.4),
+    ("Market Street", "Central Park Avenue", 0.8, 3, 0.5),
+    ("Central Park Avenue", "Market Street", 0.8, 3, 0.5),
 ]
 
 NODES = sorted(set(a for a, *_ in EDGES) | set(b for _, b, *_ in EDGES))
