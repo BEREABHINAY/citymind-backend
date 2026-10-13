@@ -41,15 +41,37 @@ BASE = os.path.dirname(__file__)
 MODEL_CACHE = os.path.join(BASE, "_model_cache.joblib")
 
 # ----------------------------------------------------------------- MODELS --
-print("Loading/training models (real dataset, RandomForest + DQN)...")
-if os.path.exists(MODEL_CACHE):
-    cache = joblib.load(MODEL_CACHE)
+print("Loading/training models (real dataset, gradient boosting + DQN)...")
+import sklearn
+
+
+def _load_cached_models():
+    """Use the pre-trained cache only if it was built with the same scikit-learn version
+    (pickled models are not guaranteed portable across versions) -- otherwise retrain."""
+    if not os.path.exists(MODEL_CACHE):
+        return None
+    try:
+        cache = joblib.load(MODEL_CACHE)
+        if cache.get("sklearn_version") != sklearn.__version__:
+            print(f"  Cache built with scikit-learn {cache.get('sklearn_version')}, "
+                  f"running {sklearn.__version__} -> retraining instead.")
+            return None
+        return cache
+    except Exception as e:  # corrupt / incompatible pickle
+        print(f"  Could not read model cache ({e}) -> retraining instead.")
+        return None
+
+
+cache = _load_cached_models()
+if cache:
     traffic_clf, fire_clf = cache["traffic_clf"], cache["fire_clf"]
-    print("  Loaded cached traffic/fire classifiers.")
+    print(f"  Loaded cached classifiers (held-out accuracy: traffic {cache.get('traffic_acc', 0):.3f}, "
+          f"fire {cache.get('fire_acc', 0):.3f}).")
 else:
     traffic_clf, t_acc, _ = classifier.train_traffic_model()
     fire_clf, f_acc, _ = classifier.train_fire_model()
-    joblib.dump({"traffic_clf": traffic_clf, "fire_clf": fire_clf}, MODEL_CACHE)
+    joblib.dump({"traffic_clf": traffic_clf, "fire_clf": fire_clf, "sklearn_version": sklearn.__version__,
+                 "traffic_acc": t_acc, "fire_acc": f_acc}, MODEL_CACHE)
     print(f"  Trained fresh. Traffic acc={t_acc:.3f} Fire acc={f_acc:.3f}")
 
 print("Training DQN router (takes ~15-20s)...")
