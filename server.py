@@ -20,6 +20,16 @@ REWARD:  -(w_dist*distance + w_time*time + w_traffic*traffic_penalty) per hop
           + big terminal bonus on reaching destination
           - penalty for revisiting a node (avoids loops)
 """
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+import classifier
+import dqn_routing
+
+app = Flask(__name__)
+CORS(app)
+
 import numpy as np
 import random
 from sklearn.neural_network import MLPRegressor
