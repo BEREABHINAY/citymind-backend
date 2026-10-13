@@ -1,196 +1,318 @@
 """
-server.py
----------
-Real backend for CityMind's AI/ML Systems panel. Loads/trains the ACTUAL
-models from classifier.py (RandomForest on real DIP features, real dataset)
-and dqn_routing.py (DQN route planner), and serves them over HTTP so the
-web app calls the real Python models instead of a JS approximation.
+dqn_routing.py
+--------------
+Deep Q-Network route planner: every traveller gives a start point and an end
+point; the agent picks the best path considering DISTANCE, TIME and live
+TRAFFIC on each road segment (fed by classifier.py's traffic-level output in
+the full system).
 
-Run:
-    pip install flask flask-cors joblib opencv-python scikit-learn --break-system-packages
-    python3 server.py
-Then open citymind_ai_enhanced.html in your browser as normal — it will
-auto-detect the server at http://localhost:5000 and switch from the
-in-browser JS fallback to real model predictions. If the server isn't
-running, the page still works standalone (JS fallback), it just won't be
-using the trained Python models.
+Function approximator: scikit-learn MLPRegressor used as the Q-network
+(no torch/GPU needed -> runs anywhere, including a CI box with no internet).
+Trained with epsilon-greedy exploration + experience replay, exactly like a
+standard DQN, just with a lighter backend. Swap in PyTorch/torch.nn for a
+GPU-scale version if your final report wants that framework name explicitly
+-- the algorithm and state/action/reward design below stay identical.
 
-Endpoints:
-    GET  /api/health
-    GET  /api/locations
-    GET  /api/samples?kind=traffic|fire&n=4   -> real images + real model predictions
-    POST /api/route          {start, dest, blocked: [["from","to"], ...]}
-    POST /api/garbage/nearest {trucks: [{id,status,at}], userLoc}
+STATE:   one-hot(current_node) + one-hot(destination_node) + traffic level
+          (0/0.33/0.66/1.0) of every outgoing edge from current_node
+ACTION:  choose one of the (up to MAX_DEGREE) outgoing edges from current_node
+REWARD:  -(w_dist*distance + w_time*time + w_traffic*traffic_penalty) per hop
+          + big terminal bonus on reaching destination
+          - penalty for revisiting a node (avoids loops)
 """
-import os
-import cv2
-import glob
+import numpy as np
 import random
-import base64
-import joblib
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from sklearn.neural_network import MLPRegressor
+from collections import deque
 
-import classifier
-import dqn_routing
+random.seed(7)
+np.random.seed(7)
 
-app = Flask(__name__)
-CORS(app)  # allow the HTML (opened via file:// or any origin) to call this API
+# ---------------------------------------------------------- CITY ROAD GRAPH --
+# distance_km, base_time_min, traffic (0=light .. 1=heavy) per directed edge.
+# Node names match the "named locations" used in the web app (see README).
+EDGES = [
+    ("MG Road Junction", "Lakeview Apartments", 1.2, 4, 0.2),
+    ("Lakeview Apartments", "MG Road Junction", 1.2, 4, 0.2),
+    ("MG Road Junction", "Central Hospital", 2.0, 6, 0.5),
+    ("Central Hospital", "MG Road Junction", 2.0, 6, 0.5),
+    ("MG Road Junction", "Tech Park Circle", 3.1, 9, 0.7),
+    ("Tech Park Circle", "MG Road Junction", 3.1, 9, 0.7),
+    ("Tech Park Circle", "Silicon Heights IT Park", 0.8, 3, 0.4),
+    ("Silicon Heights IT Park", "Tech Park Circle", 0.8, 3, 0.4),
+    ("Tech Park Circle", "Riverside Bridge", 2.5, 7, 0.3),
+    ("Riverside Bridge", "Tech Park Circle", 2.5, 7, 0.3),
+    ("Riverside Bridge", "Greenfield Apartments", 1.4, 5, 0.2),
+    ("Greenfield Apartments", "Riverside Bridge", 1.4, 5, 0.2),
+    ("Central Hospital", "Market Street", 1.0, 3, 0.6),
+    ("Market Street", "Central Hospital", 1.0, 3, 0.6),
+    ("Market Street", "Old Town Square", 0.9, 3, 0.8),
+    ("Old Town Square", "Market Street", 0.9, 3, 0.8),
+    ("Old Town Square", "Lakeview Apartments", 1.8, 5, 0.3),
+    ("Lakeview Apartments", "Old Town Square", 1.8, 5, 0.3),
+    ("Market Street", "Riverside Bridge", 2.2, 6, 0.4),
+    ("Riverside Bridge", "Market Street", 2.2, 6, 0.4),
+    ("Tech Park Circle", "Industrial Dump Yard Road", 4.0, 11, 0.1),
+    ("Industrial Dump Yard Road", "Tech Park Circle", 4.0, 11, 0.1),
+    ("Central Hospital", "Sunrise Apartments", 1.6, 5, 0.3),
+    ("Sunrise Apartments", "Central Hospital", 1.6, 5, 0.3),
+    ("Sunrise Apartments", "Old Town Square", 2.1, 6, 0.5),
+    ("Old Town Square", "Sunrise Apartments", 2.1, 6, 0.5),
+    ("Central Hospital", "Sunrise Multispecialty Hospital", 1.1, 3, 0.3),
+    ("Sunrise Multispecialty Hospital", "Central Hospital", 1.1, 3, 0.3),
+    ("Tech Park Circle", "City Grand Hotel", 1.3, 4, 0.3),
+    ("City Grand Hotel", "Tech Park Circle", 1.3, 4, 0.3),
+    ("Market Street", "Spice Route Restaurant", 0.7, 2, 0.5),
+    ("Spice Route Restaurant", "Market Street", 0.7, 2, 0.5),
+    ("Old Town Square", "Neon Cafe", 0.9, 3, 0.4),
+    ("Neon Cafe", "Old Town Square", 0.9, 3, 0.4),
+    ("MG Road Junction", "Northgate Apartments", 2.4, 7, 0.3),
+    ("Northgate Apartments", "MG Road Junction", 2.4, 7, 0.3),
+    ("Riverside Bridge", "Harbor View Hotel", 1.7, 5, 0.2),
+    ("Harbor View Hotel", "Riverside Bridge", 1.7, 5, 0.2),
+    ("Riverside Bridge", "Blue Moon Diner", 1.1, 3, 0.4),
+    ("Blue Moon Diner", "Riverside Bridge", 1.1, 3, 0.4),
+    ("City Grand Hotel", "Westside General Hospital", 1.6, 5, 0.3),
+    ("Westside General Hospital", "City Grand Hotel", 1.6, 5, 0.3),
+    ("Silicon Heights IT Park", "Pixel IT Hub", 1.2, 4, 0.4),
+    ("Pixel IT Hub", "Silicon Heights IT Park", 1.2, 4, 0.4),
+    ("Market Street", "Central Park Avenue", 0.8, 3, 0.5),
+    ("Central Park Avenue", "Market Street", 0.8, 3, 0.5),
+]
 
-BASE = os.path.dirname(__file__)
-MODEL_CACHE = os.path.join(BASE, "_model_cache.joblib")
+NODES = sorted(set(a for a, *_ in EDGES) | set(b for _, b, *_ in EDGES))
+NODE_IDX = {n: i for i, n in enumerate(NODES)}
+N = len(NODES)
+MAX_DEGREE = 5  # max outgoing roads we support per intersection in the state/action vector
 
-# ----------------------------------------------------------------- MODELS --
-print("Loading/training models (real dataset, gradient boosting + DQN)...")
-import sklearn
+ADJ = {n: [] for n in NODES}
+for a, b, dist, t, traf in EDGES:
+    ADJ[a].append({"to": b, "dist": dist, "time": t, "traffic": traf})
 
-
-def _load_cached_models():
-    """Use the pre-trained cache only if it was built with the same scikit-learn version
-    (pickled models are not guaranteed portable across versions) -- otherwise retrain."""
-    if not os.path.exists(MODEL_CACHE):
-        return None
-    try:
-        cache = joblib.load(MODEL_CACHE)
-        if cache.get("sklearn_version") != sklearn.__version__:
-            print(f"  Cache built with scikit-learn {cache.get('sklearn_version')}, "
-                  f"running {sklearn.__version__} -> retraining instead.")
-            return None
-        return cache
-    except Exception as e:  # corrupt / incompatible pickle
-        print(f"  Could not read model cache ({e}) -> retraining instead.")
-        return None
-
-
-cache = _load_cached_models()
-if cache:
-    traffic_clf, fire_clf = cache["traffic_clf"], cache["fire_clf"]
-    print(f"  Loaded cached classifiers (held-out accuracy: traffic {cache.get('traffic_acc', 0):.3f}, "
-          f"fire {cache.get('fire_acc', 0):.3f}).")
-else:
-    traffic_clf, t_acc, _ = classifier.train_traffic_model()
-    fire_clf, f_acc, _ = classifier.train_fire_model()
-    joblib.dump({"traffic_clf": traffic_clf, "fire_clf": fire_clf, "sklearn_version": sklearn.__version__,
-                 "traffic_acc": t_acc, "fire_acc": f_acc}, MODEL_CACHE)
-    print(f"  Trained fresh. Traffic acc={t_acc:.3f} Fire acc={f_acc:.3f}")
-
-print("Training DQN router (takes ~15-20s)...")
-router = dqn_routing.DQNRouter()
-router.train(episodes=1200)
-print("  DQN router ready.")
-
-# The frontend (city_offline.html) uses short slug ids for locations (e.g. "lakeview"),
-# while dqn_routing.py's graph is keyed by full display names ("Lakeview Apartments").
-# This map keeps the two in sync -- IDs here MUST match NAMED_LOCATIONS in the HTML.
-ID_TO_NAME = {
-    "mg_road": "MG Road Junction", "lakeview": "Lakeview Apartments",
-    "central_hosp": "Central Hospital", "tech_circle": "Tech Park Circle",
-    "silicon_it": "Silicon Heights IT Park", "riverside_br": "Riverside Bridge",
-    "greenfield": "Greenfield Apartments", "market_st": "Market Street",
-    "old_town": "Old Town Square", "dump_yard": "Industrial Dump Yard Road",
-    "sunrise_apt": "Sunrise Apartments", "sunrise_hosp": "Sunrise Multispecialty Hospital",
-    "grand_hotel": "City Grand Hotel", "spice_resto": "Spice Route Restaurant",
-    "neon_cafe": "Neon Cafe",
-    "northgate_apt": "Northgate Apartments", "harbor_hotel": "Harbor View Hotel",
-    "blue_moon": "Blue Moon Diner", "westside_hosp": "Westside General Hospital",
-    "pixel_it": "Pixel IT Hub", "central_park_av": "Central Park Avenue",
-}
-NAME_TO_ID = {v: k for k, v in ID_TO_NAME.items()}
-
-# ------------------------------------------------------------------ UTILS --
-
-def img_to_b64(img):
-    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-    return "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+W_DIST, W_TIME, W_TRAFFIC = 0.4, 0.4, 6.0  # reward weights (traffic penalized hardest)
 
 
-# ------------------------------------------------------------------ ROUTES --
+def encode_state(current, dest, live_traffic):
+    """live_traffic: dict edge(from,to)->override level, or None to use static graph value"""
+    vec = np.zeros(2 * N + MAX_DEGREE)
+    vec[NODE_IDX[current]] = 1
+    vec[N + NODE_IDX[dest]] = 1
+    neighbors = ADJ[current]
+    for i, edge in enumerate(neighbors[:MAX_DEGREE]):
+        key = (current, edge["to"])
+        traf = live_traffic.get(key, edge["traffic"]) if live_traffic else edge["traffic"]
+        vec[2 * N + i] = traf
+    return vec
 
-@app.route("/api/health")
-def health():
-    return jsonify({"status": "ok", "usingRealData": classifier.USING_REAL_DATA,
-                     "nodes": dqn_routing.NODES, "edges": len(dqn_routing.EDGES)})
 
-
-@app.route("/api/locations")
-def locations():
-    return jsonify([{"id": i, "name": n} for i, n in ID_TO_NAME.items()])
-
-
-@app.route("/api/samples")
-def samples():
-    kind = request.args.get("kind", "traffic")
-    n = int(request.args.get("n", 4))
-    if kind == "traffic":
-        files = glob.glob(os.path.join(classifier.TRAFFIC_DIR, "*", "*.jpg")) + \
-                glob.glob(os.path.join(classifier.TRAFFIC_DIR, "*", "*.png"))
-    else:
-        files = glob.glob(os.path.join(classifier.FIRE_DIR, "*", "*.jpg")) + \
-                glob.glob(os.path.join(classifier.FIRE_DIR, "*", "*.png"))
-    picks = random.sample(files, min(n, len(files)))
-    results = []
-    for path in picks:
-        img = cv2.imread(path)
-        if img is None:
+def dijkstra_route(start, dest, live_traffic=None, blocked_edges=None):
+    """Classical shortest-path baseline over the SAME reward-shaped edge cost the DQN was
+    trained on (distance + time + heavy traffic penalty). Used as a safety net: a greedy
+    rollout of a learned policy is not guaranteed to find the optimal path (especially right
+    after a road gets blocked, if the agent wasn't trained on that exact scenario), so
+    production routing takes the better of the DQN rollout and this exact solver. This is
+    standard practice for deploying RL in a system that must always return a valid answer.
+    blocked_edges: set of (from,to) tuples that are hard-closed (fire/accident) -- these are
+    excluded from the graph entirely, not just penalized, matching how a real road closure
+    behaves (as opposed to merely heavy traffic, which is slow but still passable)."""
+    import heapq
+    blocked_edges = blocked_edges or set()
+    dist = {n: float("inf") for n in NODES}
+    prev = {}
+    dist[start] = 0
+    pq = [(0, start)]
+    visited = set()
+    while pq:
+        d, u = heapq.heappop(pq)
+        if u in visited:
             continue
-        true_label = os.path.basename(os.path.dirname(path))
-        small = cv2.resize(img, (200, 150))
-        if kind == "traffic":
-            pred = classifier.classify_traffic_image(traffic_clf, img)
-            results.append({
-                "kind": "traffic", "trueLabel": true_label,
-                "image": img_to_b64(small),
-                "traffic": pred["traffic"], "level": pred["level"],
-                "confidence": pred["confidence"], "features": pred["features"],
-            })
-        else:
-            pred = classifier.classify_fire_image(fire_clf, img)
-            results.append({
-                "kind": "fire", "trueLabel": true_label,
-                "image": img_to_b64(small),
-                "fire": pred["fire"], "confidence": pred["confidence"],
-                "features": pred["features"],
-            })
-    return jsonify(results)
+        visited.add(u)
+        if u == dest:
+            break
+        for edge in ADJ[u]:
+            v = edge["to"]
+            if (u, v) in blocked_edges:
+                continue  # road closed -- do not traverse at all
+            traf = live_traffic.get((u, v), edge["traffic"]) if live_traffic else edge["traffic"]
+            cost = W_DIST * edge["dist"] + W_TIME * edge["time"] + W_TRAFFIC * traf
+            nd = d + cost
+            if nd < dist[v]:
+                dist[v] = nd
+                prev[v] = (u, edge, traf)
+                heapq.heappush(pq, (nd, v))
+    if dist[dest] == float("inf"):
+        return {"path": [], "reached": False, "distance_km": 0, "estimated_time_min": 0, "avg_traffic": 0}
+    path = [dest]
+    total_dist = total_time = total_traf = 0.0
+    cur = dest
+    hops = 0
+    while cur != start:
+        u, edge, traf = prev[cur]
+        total_dist += edge["dist"]
+        total_time += edge["time"] * (1 + traf)
+        total_traf += traf
+        hops += 1
+        cur = u
+        path.append(cur)
+    path.reverse()
+    return {"path": path, "reached": True, "distance_km": round(total_dist, 2),
+            "estimated_time_min": round(total_time, 1),
+            "avg_traffic": round(total_traf / max(1, hops), 2)}
 
 
-@app.route("/api/route", methods=["POST"])
-def route():
-    data = request.get_json(force=True)
-    start_id, dest_id = data["start"], data["dest"]
-    start, dest = ID_TO_NAME.get(start_id, start_id), ID_TO_NAME.get(dest_id, dest_id)
-    blocked_pairs = data.get("blocked", [])  # list of [from_id, to_id] -- hard road closures
-    blocked_names = {(ID_TO_NAME.get(a, a), ID_TO_NAME.get(b, b)) for a, b in blocked_pairs}
-    result = router.find_best_route(start, dest, blocked_edges=blocked_names)
-    result["path"] = [NAME_TO_ID.get(n, n) for n in result["path"]]
-    result["dqnPolicyPath"] = [NAME_TO_ID.get(n, n) for n in result.get("dqnPolicyPath", [])]
-    result["exactPath"] = [NAME_TO_ID.get(n, n) for n in result.get("exactPath", [])]
-    return jsonify(result)
+def _route_cost(result):
+    if not result["reached"]:
+        return float("inf")
+    return (W_DIST * result["distance_km"] + W_TIME * result["estimated_time_min"] / (1 + result["avg_traffic"])
+            + W_TRAFFIC * result["avg_traffic"] * max(1, len(result["path"]) - 1))
 
 
-@app.route("/api/garbage/nearest", methods=["POST"])
-def garbage_nearest():
-    data = request.get_json(force=True)
-    trucks = data["trucks"]
-    user_loc = ID_TO_NAME.get(data["userLoc"], data["userLoc"])
-    available = [t for t in trucks if t["status"] == "available"]
-    if not available:
-        return jsonify({"none": True})
-    scored = []
-    for t in available:
-        truck_at = ID_TO_NAME.get(t["at"], t["at"])
-        r = router.find_best_route(truck_at, user_loc)
-        if r["reached"]:
-            r["path"] = [NAME_TO_ID.get(n, n) for n in r["path"]]
-            scored.append({"truck": t, "route": r})
-    if not scored:
-        return jsonify({"none": True})
-    scored.sort(key=lambda x: x["route"]["estimated_time_min"])
-    return jsonify(scored[0])
+class DQNRouter:
+    def __init__(self):
+        self.q_net = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1,
+                                   warm_start=True, learning_rate_init=0.01, random_state=7)
+        self._bootstrap()
+        self.replay = deque(maxlen=4000)
+
+    def _bootstrap(self):
+        # one dummy fit so partial_fit-style incremental training works from step 1
+        dummy_X = np.zeros((2, 2 * N + MAX_DEGREE))
+        dummy_y = np.zeros((2, MAX_DEGREE))
+        self.q_net.fit(dummy_X, dummy_y)
+
+    def q_values(self, state):
+        return self.q_net.predict([state])[0]
+
+    def choose_action(self, current, epsilon):
+        neighbors = ADJ[current][:MAX_DEGREE]
+        if random.random() < epsilon or not neighbors:
+            return random.randrange(max(1, len(neighbors)))
+        state = encode_state(current, self._dest, self._traffic)
+        q = self.q_values(state)[:len(neighbors)]
+        return int(np.argmax(q))
+
+    def train(self, episodes=1800, epsilon_start=0.9, epsilon_end=0.05):
+        for ep in range(episodes):
+            epsilon = max(epsilon_end, epsilon_start * (1 - ep / episodes))
+            start, dest = random.sample(NODES, 2)
+            self._dest = dest
+            # random live-traffic snapshot per episode (simulates classifier.py output feed)
+            self._traffic = {(a, b): random.choice([0.1, 0.3, 0.5, 0.8, 1.0])
+                              for a, b, *_ in EDGES}
+            current = start
+            visited = {current}
+            for step in range(15):
+                neighbors = ADJ[current][:MAX_DEGREE]
+                if not neighbors:
+                    break
+                state = encode_state(current, dest, self._traffic)
+                action = self.choose_action(current, epsilon)
+                action = min(action, len(neighbors) - 1)
+                edge = neighbors[action]
+                nxt = edge["to"]
+                traf = self._traffic.get((current, nxt), edge["traffic"])
+                cost = W_DIST * edge["dist"] + W_TIME * edge["time"] + W_TRAFFIC * traf
+                reward = -cost
+                if nxt in visited:
+                    reward -= 5  # discourage loops
+                if nxt == dest:
+                    reward += 20
+                visited.add(nxt)
+                next_state = encode_state(nxt, dest, self._traffic)
+                self.replay.append((state, action, reward, next_state, nxt == dest, len(ADJ[nxt][:MAX_DEGREE])))
+                current = nxt
+                if current == dest:
+                    break
+            if len(self.replay) >= 64 and ep % 2 == 0:
+                self._replay_update()
+
+    def _replay_update(self, batch_size=64, gamma=0.9):
+        batch = random.sample(self.replay, min(batch_size, len(self.replay)))
+        X, Y = [], []
+        for state, action, reward, next_state, done, n_next_actions in batch:
+            q = self.q_values(state)
+            target = reward
+            if not done and n_next_actions > 0:
+                target += gamma * np.max(self.q_values(next_state)[:n_next_actions])
+            q[action] = target
+            X.append(state); Y.append(q)
+        self.q_net.partial_fit(X, Y)
+
+    def find_route(self, start, dest, live_traffic=None, max_hops=15):
+        """Greedy rollout of the learned DQN policy for a single traveller."""
+        current = start
+        path = [current]
+        total_dist = total_time = total_traffic_cost = 0.0
+        visited = set()
+        for _ in range(max_hops):
+            if current == dest:
+                break
+            neighbors = ADJ[current][:MAX_DEGREE]
+            if not neighbors:
+                break
+            state = encode_state(current, dest, live_traffic)
+            q = self.q_values(state)[:len(neighbors)]
+            # avoid immediate backtrack loops in greedy rollout
+            order = np.argsort(-q)
+            chosen = None
+            for idx in order:
+                cand = neighbors[idx]["to"]
+                if cand not in visited or cand == dest:
+                    chosen = neighbors[idx]
+                    break
+            if chosen is None:
+                break  # every neighbor already visited -> dead end, stop instead of looping
+            traf = live_traffic.get((current, chosen["to"]), chosen["traffic"]) if live_traffic else chosen["traffic"]
+            total_dist += chosen["dist"]
+            total_time += chosen["time"] * (1 + traf)  # traffic slows real travel time
+            total_traffic_cost += traf
+            visited.add(current)
+            current = chosen["to"]
+            path.append(current)
+        reached = current == dest
+        return {"path": path, "reached": reached, "distance_km": round(total_dist, 2),
+                "estimated_time_min": round(total_time, 1),
+                "avg_traffic": round(total_traffic_cost / max(1, len(path) - 1), 2)}
+
+    def find_best_route(self, start, dest, live_traffic=None, blocked_edges=None, max_hops=15):
+        """Production entry point: runs the trained DQN policy AND the Dijkstra safety net,
+        returns whichever has lower reward-shaped cost, and reports which one was used plus
+        both raw results -- so you can show, e.g. in a paper's results table, how often the
+        learned policy alone already matches the optimal solver."""
+        dqn_result = self.find_route(start, dest, live_traffic=live_traffic, max_hops=max_hops)
+        exact_result = dijkstra_route(start, dest, live_traffic=live_traffic, blocked_edges=blocked_edges)
+        # a DQN rollout that uses a hard-closed road is invalid outright, regardless of its cost
+        blocked_edges = blocked_edges or set()
+        dqn_uses_blocked = any((dqn_result["path"][i], dqn_result["path"][i+1]) in blocked_edges
+                                for i in range(len(dqn_result["path"]) - 1))
+        dqn_cost = float("inf") if (dqn_uses_blocked or not dqn_result["reached"]) else _route_cost(dqn_result)
+        exact_cost = _route_cost(exact_result)
+        used = "dqn_policy" if dqn_cost <= exact_cost else "dijkstra_safety_net"
+        best = dqn_result if used == "dqn_policy" else exact_result
+        return {**best, "usedSolver": used, "dqnPolicyPath": dqn_result["path"],
+                "dqnReached": dqn_result["reached"], "exactPath": exact_result["path"]}
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # cloud hosts (Render, Railway, etc.) inject PORT
-    print(f"\nCityMind AI backend ready at http://localhost:{port}")
-    print("Open citymind_ai_enhanced.html in your browser now.\n")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print("Training DQN router on", N, "nodes /", len(EDGES), "directed road segments...")
+    router = DQNRouter()
+    router.train(episodes=400)
+    print("Training complete.\n")
+
+    demo_trips = [
+        ("Sunrise Apartments", "Silicon Heights IT Park"),
+        ("Lakeview Apartments", "Central Hospital"),
+        ("Greenfield Apartments", "Old Town Square"),
+    ]
+    # simulate a live traffic snapshot as if it came from classifier.py just now
+    live_traffic = {(a, b): random.choice([0.1, 0.2, 0.9, 1.0]) for a, b, *_ in EDGES}
+
+    for start, dest in demo_trips:
+        result = router.find_route(start, dest, live_traffic=live_traffic)
+        print(f"TRIP: {start} -> {dest}")
+        print(f"  Route found : {'yes' if result['reached'] else 'NO PATH (needs more training/hops)'}")
+        print(f"  Path        : {' -> '.join(result['path'])}")
+        print(f"  Distance    : {result['distance_km']} km")
+        print(f"  Est. time   : {result['estimated_time_min']} min (traffic-adjusted)")
+        print(f"  Avg traffic on route: {result['avg_traffic']}")
+        print()
