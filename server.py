@@ -30,6 +30,20 @@ import dqn_routing
 app = Flask(__name__)
 CORS(app)
 
+@app.route("/")
+def home():
+    return jsonify({
+        "service": "CityMind Backend",
+        "status": "ok"
+    })
+
+@app.route("/api/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "service": "CityMind Backend"
+    })
+
 import numpy as np
 import random
 from sklearn.neural_network import MLPRegressor
